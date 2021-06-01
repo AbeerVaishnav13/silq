@@ -340,6 +340,7 @@ struct QState{
 		override string toString(){ return text("ref(",ref_,")"); }
 		this(Σ.Ref ref_){ this.ref_=ref_; }
 		override Value get(ref Σ s){
+			if(astopt.allowUnsafeCaptureConst) enforce(ref_ in s.qvars, "dangling reference");
 			auto r=s.qvars[ref_];
 			if(consumedOnRead) removeVar(s);
 			return r;
@@ -365,7 +366,10 @@ struct QState{
 			return this;
 		}
 		override Value toVar(ref QState state,Value self,bool cleanUp){
-			if(consumedOnRead&&cleanUp){ consumedOnRead=false; state.popFrameCleanup~=this; }
+			if(consumedOnRead){
+				consumedOnRead=false;
+				if(cleanUp) state.popFrameCleanup~=this;
+			}
 			return self;
 		}
 	}
@@ -807,6 +811,18 @@ struct QState{
 		}
 		Value opIndex(Value i){
 			if(i.isℤ()) return this[i.asℤ()];
+			if(cast(ArrayTy)i.type||cast(VectorTy)i.type||cast(TupleTy)i.type){
+				if(cast(TupleTy)type){
+					auto values=i.array_.map!(v=>this[v]).array;
+					auto ntype=tupleTy(values.map!(v=>v.type).array);
+					return makeTuple(ntype,values);
+				}
+				auto values=i.array_.map!(v=>this[v]).array;
+				auto ntype=!values.length?ast.type.unit:values.map!(v=>v.type).fold!joinTypes;
+				if(cast(ArrayTy)i.type) ntype=arrayTy(ntype);
+				if(auto vt=cast(VectorTy)i.type) ntype=vectorTy(ntype,vt.num);
+				return makeArray(arrayTy(ntype),values);
+			}
 			final switch(tag){
 				case Tag.array_:
 					// TODO: bounds checking
@@ -837,7 +853,8 @@ struct QState{
 			assert(0);
 		}
 		static Expression unaryType(string op)(Expression t){
-			static if(op=="-"||op=="~") return minusBitNotType(t);
+			static if(op=="-") return minusType(t);
+			else static if(op=="~") return bitNotType(t);
 			else static if(op=="!") return handleUnary!notType(t);
 			else{
 				enforce(0,text("TODO: '",op,"' for type ",t));
@@ -1462,7 +1479,8 @@ struct QState{
 	}
 	Value call(FunctionDef fun,Value thisExp,Value arg,Scope sc,Value* context,Expression type,Location loc){
 		Value fix(Value arg){
-			return arg; // TODO
+			if(type.isClassical()&&!arg.isClassical()) return measure(arg); // TODO: improve simulator so this is not needed
+			return arg;
 		}
 		if(fun.isReverse) return reverse(type,arg);
 		enforce(!thisExp.isValid,"TODO: method calls");
@@ -2029,7 +2047,7 @@ struct Interpreter(QState){
 				return qstate.makeTuple(unit,[]);
 			}
 			if(auto idx=cast(IndexExp)e){
-				auto a=doIt2(idx.e),i=doIt(idx.a[0]);
+				auto a=doIt2(idx.e),i=doIt(idx.a);
 				auto r=a[i];
 				if(!idx.constLookup){
 					if(idx.byRef){
@@ -2240,8 +2258,7 @@ struct Interpreter(QState){
 		if(auto id=cast(Identifier)lhs) return Assignable!isCat(id.name,[]);
 		if(auto idx=cast(IndexExp)lhs){
 			auto a=getAssignable!isCat(idx.e);
-			enforce(idx.a.length==1,"TODO");
-			auto index=runExp(idx.a[0]);
+			auto index=runExp(idx.a);
 			a.indices~=index;
 			a.locations~=idx.loc;
 			return a;
@@ -2299,15 +2316,13 @@ struct Interpreter(QState){
 		}
 		if(auto nde=cast(DefExp)e){
 			auto de=cast(DefineExp)nde.initializer;
-			assert(!!de);
-			auto lhs=de.e1, rhs=runExp(de.e2);
-			assignTo(lhs,rhs);
+			runStm2(de,retState);
 		}else if(auto ae=cast(AssignExp)e){
 			auto lhs=ae.e1,rhs=runExp(ae.e2);
 			assignTo(lhs,rhs);
 		}else if(auto ae=cast(DefineExp)e){
 			if(ae.isSwap){
-				auto tpl=cast(TupleExp)ae.e2;
+				auto tpl=cast(TupleExp)unwrap(ae.e2);
 				enforce(!!tpl);
 				swap(tpl.e[0],tpl.e[1]);
 			}else{
